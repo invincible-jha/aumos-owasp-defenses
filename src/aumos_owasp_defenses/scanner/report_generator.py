@@ -1,0 +1,359 @@
+"""Scanner — ReportGenerator produces HTML, JSON, and Markdown reports.
+
+Converts a ``ScanResult`` into a human-readable report in one of three
+formats.  No external template engines are required — HTML is generated
+using string construction with proper escaping.
+"""
+from __future__ import annotations
+
+import html
+import json
+from pathlib import Path
+
+from aumos_owasp_defenses.scanner.agent_scanner import CategoryResult, ScanResult
+
+
+# ---------------------------------------------------------------------------
+# Grade → colour
+# ---------------------------------------------------------------------------
+
+
+_GRADE_COLOURS: dict[str, str] = {
+    "A": "#2d7d46",
+    "B": "#5a9e3f",
+    "C": "#e0a820",
+    "D": "#d46b08",
+    "F": "#c0392b",
+}
+
+_STATUS_COLOURS: dict[str, str] = {
+    "PASS": "#2d7d46",
+    "WARN": "#e0a820",
+    "FAIL": "#c0392b",
+}
+
+
+# ---------------------------------------------------------------------------
+# Report generator
+# ---------------------------------------------------------------------------
+
+
+class ReportGenerator:
+    """Produces HTML, JSON, and Markdown reports from ``ScanResult`` objects.
+
+    Example
+    -------
+    >>> generator = ReportGenerator()
+    >>> html_report = generator.to_html(scan_result)
+    >>> json_report = generator.to_json(scan_result)
+    >>> md_report = generator.to_markdown(scan_result)
+    >>> generator.save(scan_result, "/tmp/report", format="html")
+    """
+
+    def to_json(self, result: ScanResult) -> str:
+        """Serialise *result* to a formatted JSON string.
+
+        Parameters
+        ----------
+        result:
+            The scan result to serialise.
+
+        Returns
+        -------
+        str
+            Pretty-printed JSON.
+        """
+        data: dict[str, object] = {
+            "agent_id": result.agent_id,
+            "profile": result.profile,
+            "scanned_at": result.scanned_at.isoformat(),
+            "scan_duration_ms": round(result.scan_duration_ms, 2),
+            "score": result.score,
+            "grade": result.grade,
+            "summary": {
+                "passed": result.passed,
+                "warned": result.warned,
+                "failed": result.failed,
+                "total": len(result.category_results),
+            },
+            "categories": [
+                {
+                    "asi_id": cat.asi_id,
+                    "name": cat.name,
+                    "status": cat.status,
+                    "score": cat.score,
+                    "summary": cat.summary,
+                    "findings": cat.findings,
+                    "recommendations": cat.recommendations,
+                    "auto_fixable": cat.auto_fixable,
+                }
+                for cat in result.category_results
+            ],
+        }
+        return json.dumps(data, indent=2, ensure_ascii=False)
+
+    def to_markdown(self, result: ScanResult) -> str:
+        """Produce a Markdown report from *result*.
+
+        Parameters
+        ----------
+        result:
+            The scan result to format.
+
+        Returns
+        -------
+        str
+            Markdown-formatted report.
+        """
+        lines: list[str] = []
+
+        lines.append("# OWASP ASI Top 10 Security Scan Report")
+        lines.append("")
+        lines.append(f"**Agent:** `{result.agent_id}`  ")
+        lines.append(f"**Profile:** {result.profile}  ")
+        lines.append(f"**Scanned at:** {result.scanned_at.isoformat()}  ")
+        lines.append(f"**Duration:** {result.scan_duration_ms:.1f} ms  ")
+        lines.append("")
+        lines.append("## Overall Score")
+        lines.append("")
+        lines.append(f"| Score | Grade | Passed | Warned | Failed |")
+        lines.append(f"|-------|-------|--------|--------|--------|")
+        lines.append(
+            f"| {result.score}/100 | **{result.grade}** | "
+            f"{result.passed} | {result.warned} | {result.failed} |"
+        )
+        lines.append("")
+        lines.append("## Category Results")
+        lines.append("")
+
+        for cat in result.category_results:
+            status_icon = {"PASS": "PASS", "WARN": "WARN", "FAIL": "FAIL"}.get(cat.status, cat.status)
+            lines.append(f"### {cat.asi_id} — {cat.name}")
+            lines.append("")
+            lines.append(f"**Status:** {status_icon} &nbsp; **Score:** {cat.score}/100")
+            lines.append("")
+            lines.append(f"{cat.summary}")
+            lines.append("")
+
+            if cat.findings:
+                lines.append("**Findings:**")
+                lines.append("")
+                for finding in cat.findings:
+                    lines.append(f"- {finding}")
+                lines.append("")
+
+            if cat.recommendations:
+                lines.append("**Recommendations:**")
+                lines.append("")
+                for rec in cat.recommendations:
+                    lines.append(f"- {rec}")
+                lines.append("")
+
+        lines.append("---")
+        lines.append("*Generated by aumos-owasp-defenses — OWASP ASI Top 10 Defensive Library*")
+        lines.append("")
+
+        return "\n".join(lines)
+
+    def to_html(self, result: ScanResult) -> str:
+        """Produce a self-contained HTML report from *result*.
+
+        Parameters
+        ----------
+        result:
+            The scan result to format.
+
+        Returns
+        -------
+        str
+            HTML document string.
+        """
+        grade_colour = _GRADE_COLOURS.get(result.grade, "#555")
+        category_html = self._render_categories_html(result.category_results)
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASI Scan Report — {html.escape(result.agent_id)}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0; padding: 2rem; background: #f5f5f7; color: #1d1d1f;
+    }}
+    .report {{
+      max-width: 960px; margin: 0 auto; background: #fff;
+      border-radius: 12px; box-shadow: 0 2px 16px rgba(0,0,0,.12);
+      overflow: hidden;
+    }}
+    header {{
+      background: #1d1d1f; color: #fff; padding: 2rem;
+    }}
+    header h1 {{ margin: 0 0 .5rem; font-size: 1.4rem; }}
+    header p {{ margin: .2rem 0; font-size: .875rem; opacity: .75; }}
+    .score-bar {{
+      display: flex; align-items: center; gap: 1.5rem;
+      padding: 1.5rem 2rem; border-bottom: 1px solid #e5e5ea;
+    }}
+    .grade-badge {{
+      font-size: 2.5rem; font-weight: 700;
+      color: {grade_colour};
+      width: 64px; text-align: center;
+    }}
+    .score-detail {{ flex: 1; }}
+    .score-detail h2 {{ margin: 0; font-size: 1.1rem; }}
+    .score-detail p {{ margin: .25rem 0 0; font-size: .875rem; color: #555; }}
+    .chips {{ display: flex; gap: .5rem; margin-top: .5rem; }}
+    .chip {{
+      padding: .2rem .7rem; border-radius: 999px;
+      font-size: .75rem; font-weight: 600;
+    }}
+    .chip-pass {{ background: #d1fae5; color: #065f46; }}
+    .chip-warn {{ background: #fef3c7; color: #92400e; }}
+    .chip-fail {{ background: #fee2e2; color: #991b1b; }}
+    .categories {{ padding: 1.5rem 2rem; }}
+    .category {{
+      border: 1px solid #e5e5ea; border-radius: 8px;
+      margin-bottom: 1rem; overflow: hidden;
+    }}
+    .category-header {{
+      display: flex; align-items: center; gap: 1rem;
+      padding: .85rem 1.25rem; cursor: default;
+    }}
+    .cat-status {{
+      font-size: .75rem; font-weight: 700;
+      padding: .2rem .6rem; border-radius: 4px;
+    }}
+    .cat-id {{ font-weight: 700; font-size: .9rem; color: #555; }}
+    .cat-name {{ flex: 1; font-weight: 500; }}
+    .cat-score {{ font-size: .875rem; color: #555; }}
+    .category-body {{ padding: .75rem 1.25rem 1rem; border-top: 1px solid #e5e5ea; }}
+    .category-body p {{ margin: 0 0 .5rem; font-size: .875rem; color: #444; }}
+    ul.findings, ul.recs {{ margin: .25rem 0 .5rem 1.2rem; padding: 0; }}
+    ul.findings li, ul.recs li {{ font-size: .84rem; margin-bottom: .25rem; }}
+    .section-label {{ font-size: .75rem; font-weight: 700; text-transform: uppercase;
+                      color: #888; margin: .75rem 0 .25rem; }}
+    footer {{
+      text-align: center; padding: 1rem;
+      font-size: .75rem; color: #888; border-top: 1px solid #e5e5ea;
+    }}
+  </style>
+</head>
+<body>
+<div class="report">
+  <header>
+    <h1>OWASP ASI Top 10 Security Scan Report</h1>
+    <p><strong>Agent:</strong> {html.escape(result.agent_id)}</p>
+    <p><strong>Profile:</strong> {html.escape(result.profile)} &nbsp;|&nbsp;
+       <strong>Scanned:</strong> {html.escape(result.scanned_at.isoformat())} &nbsp;|&nbsp;
+       <strong>Duration:</strong> {result.scan_duration_ms:.1f} ms</p>
+  </header>
+
+  <div class="score-bar">
+    <div class="grade-badge">{html.escape(result.grade)}</div>
+    <div class="score-detail">
+      <h2>Overall Score: {result.score} / 100</h2>
+      <div class="chips">
+        <span class="chip chip-pass">{result.passed} PASS</span>
+        <span class="chip chip-warn">{result.warned} WARN</span>
+        <span class="chip chip-fail">{result.failed} FAIL</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="categories">
+    {category_html}
+  </div>
+
+  <footer>Generated by <strong>aumos-owasp-defenses</strong> — OWASP ASI Top 10 Defensive Library</footer>
+</div>
+</body>
+</html>"""
+
+    def _render_categories_html(self, categories: list[CategoryResult]) -> str:
+        """Render all category results as HTML fragments."""
+        parts: list[str] = []
+        for cat in categories:
+            colour = _STATUS_COLOURS.get(cat.status, "#555")
+            findings_html = ""
+            if cat.findings:
+                items = "".join(
+                    f"<li>{html.escape(f)}</li>" for f in cat.findings
+                )
+                findings_html = (
+                    f'<div class="section-label">Findings</div>'
+                    f'<ul class="findings">{items}</ul>'
+                )
+
+            recs_html = ""
+            if cat.recommendations:
+                items = "".join(
+                    f"<li>{html.escape(r)}</li>" for r in cat.recommendations
+                )
+                recs_html = (
+                    f'<div class="section-label">Recommendations</div>'
+                    f'<ul class="recs">{items}</ul>'
+                )
+
+            parts.append(f"""<div class="category">
+  <div class="category-header">
+    <span class="cat-status" style="background:{colour}22; color:{colour};">{html.escape(cat.status)}</span>
+    <span class="cat-id">{html.escape(cat.asi_id)}</span>
+    <span class="cat-name">{html.escape(cat.name)}</span>
+    <span class="cat-score">{cat.score}/100</span>
+  </div>
+  <div class="category-body">
+    <p>{html.escape(cat.summary)}</p>
+    {findings_html}
+    {recs_html}
+  </div>
+</div>""")
+        return "\n".join(parts)
+
+    def save(
+        self,
+        result: ScanResult,
+        output_path: str,
+        fmt: str = "html",
+    ) -> Path:
+        """Write a report to *output_path*.
+
+        Parameters
+        ----------
+        result:
+            The scan result to report on.
+        output_path:
+            Destination file path (without extension — extension is added
+            automatically based on *fmt*).
+        fmt:
+            Output format: ``"html"``, ``"json"``, or ``"markdown"``
+            (also accepted: ``"md"``).
+
+        Returns
+        -------
+        Path
+            The path to the written file.
+
+        Raises
+        ------
+        ValueError
+            If *fmt* is not a recognised format.
+        """
+        format_map: dict[str, tuple[str, str]] = {
+            "html": (".html", self.to_html(result)),
+            "json": (".json", self.to_json(result)),
+            "markdown": (".md", self.to_markdown(result)),
+            "md": (".md", self.to_markdown(result)),
+        }
+        if fmt not in format_map:
+            raise ValueError(
+                f"Unknown report format {fmt!r}. "
+                f"Valid formats: {list(format_map)!r}"
+            )
+        extension, content = format_map[fmt]
+        path = Path(output_path).with_suffix(extension)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
