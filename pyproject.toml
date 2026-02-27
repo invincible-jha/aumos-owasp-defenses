@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aumos-owasp-defenses"
-version = "0.1.0"
+version = "0.2.0"
 description = "OWASP Agentic Security Top 10 defensive implementations"
 readme = "README.md"
 requires-python = ">=3.10"
