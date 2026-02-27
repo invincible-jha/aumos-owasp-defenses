@@ -309,6 +309,158 @@ def patterns_list_command(min_level: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# certify
+# ---------------------------------------------------------------------------
+
+
+@cli.command(name="certify")
+@click.argument("target", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    show_default=True,
+    help="Write SVG badge to this path (e.g. badge.svg). Skipped when not supplied.",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["json", "table"]),
+    default="table",
+    show_default=True,
+    help="Console output format.",
+)
+@click.option(
+    "--profile",
+    type=click.Choice(["standard", "quick", "mcp_focused", "compliance"]),
+    default="standard",
+    show_default=True,
+    help="Scan profile used before certification evaluation.",
+)
+def certify_command(
+    target: Path,
+    output: str | None,
+    output_format: str,
+    profile: str,
+) -> None:
+    """Evaluate an agent configuration and determine its ASI certification level.
+
+    TARGET may be a JSON or YAML file containing the agent config dict.
+
+    The command runs a full agent scan and then derives the highest
+    certification level (ASI-Basic, ASI-Standard, or ASI-Advanced) that
+    the agent satisfies.  Optionally writes an SVG compliance badge.
+
+    Example::
+
+        aumos-owasp certify my_agent.yaml --output badge.svg --format json
+    """
+    from aumos_owasp_defenses.scanner import AgentScanner
+    from aumos_owasp_defenses.certification import (
+        CertificationEvaluator,
+        BadgeGenerator,
+        CertificationLevel,
+    )
+
+    # --- Load agent config ---
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[red]Error reading {target}: {exc}[/red]")
+        sys.exit(1)
+
+    agent_config: dict[str, object]
+    try:
+        if target.suffix.lower() in (".yaml", ".yml"):
+            loaded = yaml.safe_load(raw)
+            agent_config = loaded if isinstance(loaded, dict) else {}
+        else:
+            loaded = json.loads(raw)
+            agent_config = loaded if isinstance(loaded, dict) else {}
+    except Exception as exc:
+        console.print(f"[red]Error parsing {target}: {exc}[/red]")
+        sys.exit(1)
+
+    # --- Run scan ---
+    scanner = AgentScanner(profile=profile)
+    with console.status("[bold green]Scanning agent configuration..."):
+        scan_result = scanner.scan(agent_config)
+
+    # --- Evaluate certification ---
+    evaluator = CertificationEvaluator()
+    cert = evaluator.evaluate_scan_result(scan_result)
+
+    level_colours: dict[str, str] = {
+        CertificationLevel.ADVANCED.value: "green",
+        CertificationLevel.STANDARD.value: "blue",
+        CertificationLevel.BASIC.value: "yellow",
+        CertificationLevel.NONE.value: "red",
+    }
+    level_colour = level_colours.get(cert.level.value, "white")
+
+    if output_format == "json":
+        import json as json_mod
+
+        output_dict = {
+            "level": cert.level.value,
+            "display_name": cert.level.display_name(),
+            "categories_assessed": cert.categories_assessed,
+            "warn_passed": cert.warn_passed,
+            "strict_passed": cert.strict_passed,
+            "overall_score": cert.overall_score,
+            "timestamp": cert.timestamp,
+            "category_results": [
+                {
+                    "category": r.category,
+                    "warn_passed": r.warn_passed,
+                    "strict_passed": r.strict_passed,
+                    "findings_count": r.findings_count,
+                    "details": r.details,
+                }
+                for r in cert.category_results
+            ],
+        }
+        console.print_json(json_mod.dumps(output_dict, indent=2))
+    else:
+        # Table format
+        console.print()
+        console.print(
+            f"[bold]Certification Level:[/bold] "
+            f"[{level_colour}]{cert.level.display_name()}[/{level_colour}]  "
+            f"[bold]Score:[/bold] {cert.overall_score:.2%}  "
+            f"WARN:{cert.warn_passed}/10  STRICT:{cert.strict_passed}/10"
+        )
+        console.print()
+
+        table = Table(box=box.ROUNDED, show_header=True, header_style="bold")
+        table.add_column("Category", min_width=40)
+        table.add_column("WARN", width=6, justify="center")
+        table.add_column("STRICT", width=7, justify="center")
+        table.add_column("Findings", width=9, justify="right")
+        table.add_column("Details", min_width=35)
+
+        for cat_result in cert.category_results:
+            warn_icon = "[green]PASS[/green]" if cat_result.warn_passed else "[red]FAIL[/red]"
+            strict_icon = "[green]PASS[/green]" if cat_result.strict_passed else "[red]FAIL[/red]"
+            table.add_row(
+                cat_result.category,
+                warn_icon,
+                strict_icon,
+                str(cat_result.findings_count),
+                cat_result.details[:55],
+            )
+
+        console.print(table)
+        console.print()
+
+    # --- Write badge ---
+    if output:
+        generator = BadgeGenerator()
+        badge_path = generator.save(cert.level, output)
+        console.print(f"[bold]Badge written to:[/bold] {badge_path}")
+
+
+# ---------------------------------------------------------------------------
 # plugins (from scaffold)
 # ---------------------------------------------------------------------------
 
