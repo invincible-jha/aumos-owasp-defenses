@@ -48,6 +48,8 @@ from __future__ import annotations
 
 __version__: str = "0.1.0"
 
+from aumos_owasp_defenses.convenience import OWASPDefenses
+
 # ---------------------------------------------------------------------------
 # ASI-01: Goal and Task Hijacking
 # ---------------------------------------------------------------------------
@@ -182,6 +184,7 @@ from aumos_owasp_defenses.scanner.report_generator import ReportGenerator
 
 __all__ = [
     "__version__",
+    "OWASPDefenses",
     # ASI-01
     "BoundaryAnalysis",
     "BoundaryDetector",
