@@ -273,12 +273,3 @@ export function createOwaspDefensesClient(
   };
 }
 
-/** Re-export types for convenience. */
-export type {
-  ScanResult,
-  ValidationResult,
-  ComplianceReport,
-  DefenseConfig,
-  ScanInputRequest,
-  ScanOutputRequest,
-};
