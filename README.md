@@ -21,6 +21,14 @@ Part of the [AumOS](https://github.com/aumos-ai) open-source agent infrastructur
 - `agentcore` bridge hooks the scanner into the `EventBus` so defense checks fire automatically on lifecycle events
 - Report generator produces per-category results with actionable remediation steps in JSON or Markdown
 
+## Current Limitations
+
+> **Transparency note**: We list known limitations to help you evaluate fit.
+
+- **Detection**: Pattern-based OWASP defense matching. No behavioral ML analysis.
+- **Coverage**: ASI 10/10 mapped — defense depth varies per category.
+- **Updates**: Static pattern set — no automatic update mechanism.
+
 ## Quick Start
 
 Install from PyPI:

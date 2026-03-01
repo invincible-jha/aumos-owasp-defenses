@@ -1,8 +1,12 @@
 /**
  * HTTP client for the AumOS OWASP ASI Top 10 defensive library API.
  *
- * Uses the Fetch API (available natively in Node 18+, browsers, and Deno).
- * No external dependencies required.
+ * Delegates all HTTP transport to `@aumos/sdk-core` which provides
+ * automatic retry with exponential back-off, timeout management via
+ * `AbortSignal.timeout`, interceptor support, and a typed error hierarchy.
+ *
+ * The public-facing `ApiResult<T>` envelope is preserved for full
+ * backward compatibility with existing callers.
  *
  * @example
  * ```ts
@@ -21,8 +25,16 @@
  * ```
  */
 
+import {
+  createHttpClient,
+  HttpError,
+  NetworkError,
+  TimeoutError,
+  AumosError,
+  type HttpClient,
+} from "@aumos/sdk-core";
+
 import type {
-  ApiError,
   ApiResult,
   ComplianceReport,
   DefenseConfig,
@@ -47,55 +59,51 @@ export interface OwaspDefensesClientConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Internal adapter
 // ---------------------------------------------------------------------------
 
-async function fetchJson<T>(
-  url: string,
-  init: RequestInit,
-  timeoutMs: number,
+async function callApi<T>(
+  operation: () => Promise<{ readonly data: T; readonly status: number }>,
 ): Promise<ApiResult<T>> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
   try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
-    clearTimeout(timeoutId);
-
-    const body = await response.json() as unknown;
-
-    if (!response.ok) {
-      const errorBody = body as Partial<ApiError>;
+    const response = await operation();
+    return { ok: true, data: response.data };
+  } catch (error: unknown) {
+    if (error instanceof HttpError) {
       return {
         ok: false,
-        error: {
-          error: errorBody.error ?? "Unknown error",
-          detail: errorBody.detail ?? "",
-        },
-        status: response.status,
+        error: { error: error.message, detail: String(error.body ?? "") },
+        status: error.statusCode,
       };
     }
-
-    return { ok: true, data: body as T };
-  } catch (err: unknown) {
-    clearTimeout(timeoutId);
-    const message = err instanceof Error ? err.message : String(err);
+    if (error instanceof TimeoutError) {
+      return {
+        ok: false,
+        error: { error: "Request timed out", detail: error.message },
+        status: 0,
+      };
+    }
+    if (error instanceof NetworkError) {
+      return {
+        ok: false,
+        error: { error: "Network error", detail: error.message },
+        status: 0,
+      };
+    }
+    if (error instanceof AumosError) {
+      return {
+        ok: false,
+        error: { error: error.code, detail: error.message },
+        status: error.statusCode ?? 0,
+      };
+    }
+    const message = error instanceof Error ? error.message : String(error);
     return {
       ok: false,
-      error: { error: "Network error", detail: message },
+      error: { error: "Unexpected error", detail: message },
       status: 0,
     };
   }
-}
-
-function buildHeaders(
-  extraHeaders: Readonly<Record<string, string>> | undefined,
-): Record<string, string> {
-  return {
-    "Content-Type": "application/json",
-    Accept: "application/json",
-    ...extraHeaders,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -107,9 +115,6 @@ export interface OwaspDefensesClient {
   /**
    * Scan an agent's input payload for security threats.
    *
-   * Evaluates the input against all relevant ASI defense categories
-   * and returns detected threats along with a blocking decision.
-   *
    * @param request - The input payload and agent context.
    * @returns A ValidationResult with threat detections and blocking decision.
    */
@@ -117,9 +122,6 @@ export interface OwaspDefensesClient {
 
   /**
    * Scan an agent's output payload for security issues.
-   *
-   * Evaluates the output for data exfiltration, PII leakage, and
-   * other output-side ASI violations.
    *
    * @param request - The output payload and agent context.
    * @returns A ValidationResult with threat detections and blocking decision.
@@ -129,9 +131,6 @@ export interface OwaspDefensesClient {
   /**
    * Retrieve the current defense status for a configured agent.
    *
-   * Returns a full ScanResult representing the agent's current
-   * defense posture based on its declared configuration.
-   *
    * @param agentId - The agent identifier to inspect.
    * @returns A ScanResult with per-category scores and grades.
    */
@@ -139,9 +138,6 @@ export interface OwaspDefensesClient {
 
   /**
    * Validate an agent tool declaration against security rules.
-   *
-   * Checks whether the tool's schema, name, and configuration
-   * conform to ASI-02 (Tool and Resource Misuse) requirements.
    *
    * @param agentId - The agent that owns the tool.
    * @param toolName - The name of the tool to validate.
@@ -156,9 +152,6 @@ export interface OwaspDefensesClient {
 
   /**
    * Generate a compliance report for an agent based on its defense configuration.
-   *
-   * Runs the full scan profile against the supplied DefenseConfig and
-   * returns a structured compliance report.
    *
    * @param config - The agent defense configuration to evaluate.
    * @returns A ComplianceReport with overall status, score, and per-category details.
@@ -187,89 +180,54 @@ export interface OwaspDefensesClient {
 export function createOwaspDefensesClient(
   config: OwaspDefensesClientConfig,
 ): OwaspDefensesClient {
-  const { baseUrl, timeoutMs = 30_000, headers: extraHeaders } = config;
-  const baseHeaders = buildHeaders(extraHeaders);
+  const http: HttpClient = createHttpClient({
+    baseUrl: config.baseUrl,
+    timeout: config.timeoutMs ?? 30_000,
+    defaultHeaders: config.headers,
+  });
 
   return {
-    async scanInput(
-      request: ScanInputRequest,
-    ): Promise<ApiResult<ValidationResult>> {
-      return fetchJson<ValidationResult>(
-        `${baseUrl}/scan/input`,
-        {
-          method: "POST",
-          headers: baseHeaders,
-          body: JSON.stringify(request),
-        },
-        timeoutMs,
+    scanInput(request: ScanInputRequest): Promise<ApiResult<ValidationResult>> {
+      return callApi(() => http.post<ValidationResult>("/scan/input", request));
+    },
+
+    scanOutput(request: ScanOutputRequest): Promise<ApiResult<ValidationResult>> {
+      return callApi(() => http.post<ValidationResult>("/scan/output", request));
+    },
+
+    getDefenseStatus(agentId: string): Promise<ApiResult<ScanResult>> {
+      return callApi(() =>
+        http.get<ScanResult>(`/agents/${encodeURIComponent(agentId)}/status`),
       );
     },
 
-    async scanOutput(
-      request: ScanOutputRequest,
-    ): Promise<ApiResult<ValidationResult>> {
-      return fetchJson<ValidationResult>(
-        `${baseUrl}/scan/output`,
-        {
-          method: "POST",
-          headers: baseHeaders,
-          body: JSON.stringify(request),
-        },
-        timeoutMs,
-      );
-    },
-
-    async getDefenseStatus(agentId: string): Promise<ApiResult<ScanResult>> {
-      return fetchJson<ScanResult>(
-        `${baseUrl}/agents/${encodeURIComponent(agentId)}/status`,
-        { method: "GET", headers: baseHeaders },
-        timeoutMs,
-      );
-    },
-
-    async validateTool(
+    validateTool(
       agentId: string,
       toolName: string,
       toolSchema: Readonly<Record<string, unknown>>,
     ): Promise<ApiResult<ValidationResult>> {
-      return fetchJson<ValidationResult>(
-        `${baseUrl}/tools/validate`,
-        {
-          method: "POST",
-          headers: baseHeaders,
-          body: JSON.stringify({ agent_id: agentId, tool_name: toolName, schema: toolSchema }),
-        },
-        timeoutMs,
+      return callApi(() =>
+        http.post<ValidationResult>("/tools/validate", {
+          agent_id: agentId,
+          tool_name: toolName,
+          schema: toolSchema,
+        }),
       );
     },
 
-    async getComplianceReport(
-      config: DefenseConfig,
-    ): Promise<ApiResult<ComplianceReport>> {
-      return fetchJson<ComplianceReport>(
-        `${baseUrl}/compliance/report`,
-        {
-          method: "POST",
-          headers: baseHeaders,
-          body: JSON.stringify(config),
-        },
-        timeoutMs,
+    getComplianceReport(config: DefenseConfig): Promise<ApiResult<ComplianceReport>> {
+      return callApi(() =>
+        http.post<ComplianceReport>("/compliance/report", config),
       );
     },
 
-    async registerConfig(
-      config: DefenseConfig,
-    ): Promise<ApiResult<DefenseConfig>> {
-      return fetchJson<DefenseConfig>(
-        `${baseUrl}/agents/${encodeURIComponent(config.agent_id)}/config`,
-        {
-          method: "PUT",
-          headers: baseHeaders,
-          body: JSON.stringify(config),
-        },
-        timeoutMs,
+    registerConfig(config: DefenseConfig): Promise<ApiResult<DefenseConfig>> {
+      return callApi(() =>
+        http.put<DefenseConfig>(
+          `/agents/${encodeURIComponent(config.agent_id)}/config`,
+          config,
+        ),
       );
     },
   };
 }
-
